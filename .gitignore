@@ -1,0 +1,6 @@
+.gradle
+build
+results
+*.msi
+.idea
+.kotlin
