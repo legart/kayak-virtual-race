@@ -407,7 +407,7 @@ class RaceEngine(
             prevType2Distance[idx] = -1f
             boostTrackers[idx].reset()
             lane.copy(
-                active = if (current.usingEmulator && lane.connected) true else false,
+                active = (current.usingEmulator && lane.connected),
                 readyAck = false,
                 interpolatedDistanceMeters = 0f,
                 rawDistanceMeters = 0f,
@@ -1010,7 +1010,7 @@ class RaceEngine(
                 updateSingleLane(laneIdx) {
                     it.copy(
                         connected = matchCount == 1,
-                        active = if (matchCount == 1 && current.usingEmulator) true else false,
+                        active = (matchCount == 1 && current.usingEmulator),
                         boxStatus = color
                     )
                 }

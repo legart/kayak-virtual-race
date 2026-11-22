@@ -349,7 +349,6 @@ class RaceWebServer(
 
     internal fun buildStateJson(): String {
         val state = engine.uiState.value
-        val emuUnits = engine.emulatedTransport.units.value
         val configuredCount = state.configuredLanesCount.coerceIn(1, DansprintProtocol.MAX_LANES)
         val visibleLanes = state.visibleLanes()
 

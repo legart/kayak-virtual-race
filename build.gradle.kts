@@ -1,9 +1,11 @@
+import name.remal.gradle_plugins.sonarlint.SonarLint
 import org.jetbrains.compose.desktop.application.dsl.TargetFormat
 
 plugins {
     kotlin("jvm") version "2.4.21"
     id("org.jetbrains.kotlin.plugin.compose") version "2.4.21"
     id("org.jetbrains.compose") version "1.12.2"
+    id("name.remal.sonarlint") version "7.2.0"
 }
 
 group = "dk.kodeologi.virtualrace"
@@ -45,4 +47,21 @@ tasks.withType<JavaExec>().configureEach {
 tasks.test {
     useJUnitPlatform()
     jvmArgs("--enable-native-access=ALL-UNNAMED")
+}
+
+sonarLint {
+    ignoreFailures.set(true)
+}
+
+tasks.withType<SonarLint>().configureEach {
+    reports {
+        html.required.set(true)
+        xml.required.set(true)
+    }
+}
+
+tasks.register("sonarlintReport") {
+    group = "verification"
+    description = "Runs SonarLint analysis for all source sets and generates HTML and XML reports."
+    dependsOn(tasks.withType<SonarLint>())
 }
