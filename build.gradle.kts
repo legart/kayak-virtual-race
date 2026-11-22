@@ -7,7 +7,7 @@ plugins {
 }
 
 group = "dk.kodeologi.virtualrace"
-version = "0.0.1"
+version = "1.0.0"
 
 kotlin {
     jvmToolchain(25)
@@ -31,7 +31,7 @@ compose.desktop {
         nativeDistributions {
             targetFormats(TargetFormat.Deb, TargetFormat.Msi, TargetFormat.Dmg)
             packageName = "KayakVirtualRace"
-            packageVersion = "0.0.1"
+            packageVersion = "1.0.0"
             description = "Kayak Virtual Race - Arcade Kayak Sprint Edition"
             vendor = "Kodeologi"
         }
