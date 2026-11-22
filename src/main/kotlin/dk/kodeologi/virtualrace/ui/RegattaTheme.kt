@@ -31,7 +31,6 @@ object RegattaTheme {
     val ArcadePanelBg = Color(0xFF172A54)
     val ArcadePanelLight = Color(0xFF213B73)
     val ArcadeBorderGold = Color(0xFFFFD600)
-    val ArcadeBorderWhite = Color(0xFFE8F1FF)
 
     // Water & regatta track colors
     val WaterDeep = Color(0xFF0277BD)
@@ -42,10 +41,7 @@ object RegattaTheme {
     // High-contrast regatta accent colors
     val AlertRed = Color(0xFFFF1744)
     val SuccessGreen = Color(0xFF00E676)
-    val AccentPink = Color(0xFFFF4081)
     val AccentBlue = Color(0xFF2979FF)
-    val AccentLime = Color(0xFF76FF03)
-    val AccentOrange = Color(0xFFFF9100)
     val AccentYellow = Color(0xFFFFEA00)
     val AccentPurple = Color(0xFFD500F9)
 

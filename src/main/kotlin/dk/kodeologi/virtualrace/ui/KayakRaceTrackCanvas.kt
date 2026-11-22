@@ -31,7 +31,6 @@ import dk.kodeologi.virtualrace.engine.BoxStatusColor
 import dk.kodeologi.virtualrace.engine.LaneTelemetryState
 import dk.kodeologi.virtualrace.engine.RaceState
 import dk.kodeologi.virtualrace.engine.RaceUiState
-import dk.kodeologi.virtualrace.protocol.DansprintProtocol
 import dk.kodeologi.virtualrace.transport.EmulatedErgoUnitState
 import dk.kodeologi.virtualrace.transport.PaddlerPersona
 import kotlin.math.PI

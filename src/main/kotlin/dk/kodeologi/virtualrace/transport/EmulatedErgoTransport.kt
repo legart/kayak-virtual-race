@@ -13,7 +13,6 @@ import java.util.concurrent.atomic.AtomicLong
 import kotlin.math.cos
 import kotlin.math.max
 import kotlin.math.min
-import kotlin.math.roundToLong
 import kotlin.math.sin
 import kotlin.random.Random
 
@@ -21,21 +20,19 @@ import kotlin.random.Random
  * AI / Player pacing profile for each emulated ergometer lane.
  */
 enum class PaddlerPersona(
-    val title: String,
     val baseCruiseKmh: Float,
     val sprintBurstKmh: Float,
-    val strokeCadenceHz: Float,
-    val description: String
+    val strokeCadenceHz: Float
 ) {
-    BALANCED_SPRINTER("Balanced Sprinter", 16.4f, 19.2f, 2.1f, "Balanced sprint kayaker with strong finish"),
-    MID_RACE_SURGER("Mid-Race Surger", 16.1f, 19.5f, 2.0f, "Smooth long strokes, surges mid-race"),
-    HIGH_CADENCE("High Cadence", 15.8f, 18.8f, 2.2f, "High-cadence light glider"),
-    FAST_STARTER("Fast Starter", 16.7f, 19.8f, 2.3f, "Explosive starter, fast cadence"),
-    BURST_SPRINTER("Burst Sprinter", 15.5f, 20.1f, 2.5f, "Ultra-fast cadence with bursty speed"),
-    POWER_PADDLER("Power Paddler", 16.9f, 18.9f, 1.85f, "High power per stroke"),
-    SURGE_PACER("Surge Pacer", 16.0f, 19.4f, 1.95f, "Unpredictable mid-course surges"),
-    STRONG_FINISHER("Strong Finisher", 16.5f, 19.3f, 1.9f, "Heavy water-moving powerhouse"),
-    MANUAL_PLAYER("Manual (SPACE)", 0.0f, 22.0f, 2.4f, "Tap SPACEBAR to paddle yourself")
+    BALANCED_SPRINTER(16.4f, 19.2f, 2.1f),
+    MID_RACE_SURGER(16.1f, 19.5f, 2.0f),
+    HIGH_CADENCE(15.8f, 18.8f, 2.2f),
+    FAST_STARTER(16.7f, 19.8f, 2.3f),
+    BURST_SPRINTER(15.5f, 20.1f, 2.5f),
+    POWER_PADDLER(16.9f, 18.9f, 1.85f),
+    SURGE_PACER(16.0f, 19.4f, 1.95f),
+    STRONG_FINISHER(16.5f, 19.3f, 1.9f),
+    MANUAL_PLAYER(0.0f, 22.0f, 2.4f)
 }
 
 /**
@@ -134,8 +131,8 @@ class EmulatedErgoTransport : ErgoTransport {
     @Synchronized
     override fun isDeviceOpen(usbIndex: Int): Boolean {
         return usbIndex in 0 until DansprintProtocol.MAX_LANES &&
-            handleOpen[usbIndex] &&
-            _units.value[usbIndex].pluggedIn
+                handleOpen[usbIndex] &&
+                _units.value[usbIndex].pluggedIn
     }
 
     /**
@@ -160,6 +157,7 @@ class EmulatedErgoTransport : ErgoTransport {
                         handleHostType1Command(usbIndex, packet, 4)
                     }
                 }
+
                 0xFC.toByte() -> {
                     if (packet.size >= 4 + DansprintProtocol.TYPE2_PAYLOAD_LEN &&
                         DansprintProtocol.verifyChecksum(packet, 4, DansprintProtocol.TYPE2_PAYLOAD_LEN)
@@ -246,7 +244,8 @@ class EmulatedErgoTransport : ErgoTransport {
         val indices = if (targetUsbIndex != null) {
             listOf(targetUsbIndex)
         } else {
-            val manualIndices = list.filter { it.pluggedIn && it.persona == PaddlerPersona.MANUAL_PLAYER }.map { it.usbIndex }
+            val manualIndices =
+                list.filter { it.pluggedIn && it.persona == PaddlerPersona.MANUAL_PLAYER }.map { it.usbIndex }
             manualIndices.ifEmpty { listOf(0) }
         }
 
@@ -477,7 +476,8 @@ class EmulatedErgoTransport : ErgoTransport {
                         lastPreStartStrokeEmitMs[idx] = now
                         val isPaddling = u.forcePreStartPaddling || manualStrokeEnergyKmh[idx] > 2.0f
                         val metric = if (isPaddling) 215.0f else 0.0f
-                        val periodTicks = if (metric > 0f) DansprintProtocol.FLYWHEEL_METRIC_NUMERATOR / metric else 0.0f
+                        val periodTicks =
+                            if (metric > 0f) DansprintProtocol.FLYWHEEL_METRIC_NUMERATOR / metric else 0.0f
                         val pulseAgeMs = if (isPaddling) 80L else 2_500L
                         val pulseAgeTicks = pulseAgeMs * DansprintProtocol.ERGO_TICKS_PER_MS
 
@@ -505,8 +505,10 @@ class EmulatedErgoTransport : ErgoTransport {
                         manualStrokeEnergyKmh[idx]
                     } else {
                         val strokeWave = sin(elapsedSec * persona.strokeCadenceHz * 2.0 * Math.PI).toFloat() * 0.85f
-                        val startSprint = if (elapsedSec < 4.5f) (elapsedSec / 4.5f) * persona.sprintBurstKmh else persona.baseCruiseKmh
-                        val finishKick = if (progressRatio > 0.78f) (persona.sprintBurstKmh - persona.baseCruiseKmh) * 0.65f else 0f
+                        val startSprint =
+                            if (elapsedSec < 4.5f) (elapsedSec / 4.5f) * persona.sprintBurstKmh else persona.baseCruiseKmh
+                        val finishKick =
+                            if (progressRatio > 0.78f) (persona.sprintBurstKmh - persona.baseCruiseKmh) * 0.65f else 0f
                         // Slight arcade rubber-banding relative to leader distance broadcast by host!
                         val behindLeader = (u.leaderDistanceFromHost - u.currentDistanceMeters).coerceIn(-10f, 25f)
                         val catchupBonus = if (behindLeader > 2f) min(1.4f, behindLeader * 0.08f) else 0f

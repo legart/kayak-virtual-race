@@ -117,7 +117,7 @@ data class LaneTelemetryState(
 data class RaceUiState(
     val usingEmulator: Boolean = false,
     val transportModeName: String = "",
-    val raceState: dk.kodeologi.virtualrace.engine.RaceState = RaceState.IDLE_PRE_RACE,
+    val raceState: RaceState = RaceState.IDLE_PRE_RACE,
     val raceNumber: Int = 1,
     val configuredLanesCount: Int = 6,
     val raceDistanceMeters: Int = 200,
@@ -130,7 +130,7 @@ data class RaceUiState(
     val elapsedTimerMs: Long = 0L,
     val leaderLaneIndex: Int = 0,
     val maxBoatDistanceMeters: Float = 0.0f,
-    val lanes: List<dk.kodeologi.virtualrace.engine.LaneTelemetryState> = List(DansprintProtocol.MAX_LANES) {
+    val lanes: List<LaneTelemetryState> = List(DansprintProtocol.MAX_LANES) {
         LaneTelemetryState(
             it
         )
@@ -142,7 +142,7 @@ data class RaceUiState(
      * Returns only the configured lanes whose ergometers are currently connected (or active in-race),
      * so disconnected lanes dynamically hide and re-appear on connect/disconnect.
      */
-    fun visibleLanes(): List<dk.kodeologi.virtualrace.engine.LaneTelemetryState> =
+    fun visibleLanes(): List<LaneTelemetryState> =
         lanes.take(configuredLanesCount.coerceIn(1, DansprintProtocol.MAX_LANES))
             .filter { it.isVisibleInRaceUi(raceState) }
 }

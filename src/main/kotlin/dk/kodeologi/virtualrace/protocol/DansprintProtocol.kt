@@ -41,7 +41,6 @@ object DansprintProtocol {
     const val TYPE1_PAYLOAD_LEN: Int = 25 // 0x19 -> Total frame = 29 bytes
     const val TYPE2_PAYLOAD_LEN: Int = 14 // 0x0E -> Total frame = 18 bytes
     const val TYPE3_PAYLOAD_LEN: Int = 6  // 0x06 -> Total frame = 10 bytes
-    const val RESET_MARKER_LEN: Int = 4   // "READ" -> Total frame = 4 bytes
 
     val SYNC_TYPE1: ByteArray = byteArrayOf(0xFF.toByte(), 0xFF.toByte(), 0xFF.toByte(), 0xFB.toByte())
     val SYNC_TYPE2: ByteArray = byteArrayOf(0xFF.toByte(), 0xFF.toByte(), 0xFF.toByte(), 0xFC.toByte())
