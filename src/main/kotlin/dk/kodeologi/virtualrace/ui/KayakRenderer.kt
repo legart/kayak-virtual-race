@@ -52,7 +52,7 @@ internal fun DrawScope.drawSprintKayak(
     val effectiveBoostIntensity = (if (boostIntensity > 0f) boostIntensity else lane.boostIntensity).coerceIn(0.35f, 1.0f)
 
     // Seamless bobbing & stroke dynamics (integer multiples of wavePhase avoid loop seam jumps)
-    val bobY = sin(wavePhase * 2f + lane.laneIndex * 1.2f) * (if (isMoving) 1.0f else 1.5f)
+    val bobY = sin(wavePhase * 2f + lane.laneIndex * 1.2f) * (if (isMoving) 0.3f else 0.6f)
     val strokePhase = if (isMoving) {
         lane.interpolatedDistanceMeters * 2.5f + wavePhase * 2f
     } else {
@@ -61,10 +61,11 @@ internal fun DrawScope.drawSprintKayak(
     val strokeSine = sin(strokePhase)
     val strokeCos = cos(strokePhase)
 
+    // Sprint kayaks track nearly dead straight under rudder control; keep hull yaw subtle except on spin-out
     val yawDeg = when {
         isSpinningOut -> sin(wavePhase * 4f) * 34f + cos(wavePhase * 2f) * 14f
-        isMoving -> strokeSine * (1.8f + speedRatio * 1.4f)
-        else -> sin(wavePhase + lane.laneIndex * 1.1f) * 1.1f
+        isMoving -> strokeSine * (0.35f + speedRatio * 0.15f)
+        else -> sin(wavePhase + lane.laneIndex * 1.1f) * 0.3f
     }
 
     val cx = centerX
@@ -185,7 +186,7 @@ internal fun DrawScope.drawSprintKayak(
             sternX = cx - halfLen,
             cy = cy,
             halfWidth = halfWidth,
-            rudderAngleDeg = if (isMoving) -strokeSine * 11f else 0f
+            rudderAngleDeg = if (isMoving) -strokeSine * 2.5f else 0f
         )
 
         // 3e. Sculpted 3D Kayak Hull & Custom Racing Livery
