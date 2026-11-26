@@ -639,6 +639,7 @@ private fun EmulatorAndWireLabPanel(
         } else {
             WireProtocolHexLogTab(
                 wireLog = wireLog,
+                lastRaceLogPath = uiState.lastRaceLogPath,
                 onClear = { engine.activeTransport.clearWireLog() }
             )
         }
@@ -843,6 +844,7 @@ private fun SmallEmuChip(
 @Composable
 private fun ColumnScope.WireProtocolHexLogTab(
     wireLog: List<WirePacketLogEntry>,
+    lastRaceLogPath: String?,
     onClear: () -> Unit
 ) {
     Row(
@@ -860,6 +862,17 @@ private fun ColumnScope.WireProtocolHexLogTab(
             label = "🗑 Clear Log",
             bgColor = Color(0xFF37474F),
             onClick = onClear
+        )
+    }
+
+    if (!lastRaceLogPath.isNullOrBlank()) {
+        Text(
+            text = "📝 Race comm log: $lastRaceLogPath",
+            color = Color(0xFF80CBC4),
+            fontSize = 9.5.sp,
+            fontFamily = FontFamily.Monospace,
+            maxLines = 1,
+            overflow = TextOverflow.Ellipsis
         )
     }
 
@@ -1233,6 +1246,16 @@ private fun RaceResultsOverlay(
                         fontWeight = FontWeight.SemiBold,
                         maxLines = 1
                     )
+                    if (!uiState.lastRaceLogPath.isNullOrBlank()) {
+                        Text(
+                            text = "Comm log: ${uiState.lastRaceLogPath}",
+                            color = Color(0xFF80CBC4),
+                            fontSize = 11.sp,
+                            fontFamily = FontFamily.Monospace,
+                            maxLines = 1,
+                            overflow = TextOverflow.Ellipsis
+                        )
+                    }
                 }
 
                 Row(horizontalArrangement = Arrangement.spacedBy(8.dp)) {

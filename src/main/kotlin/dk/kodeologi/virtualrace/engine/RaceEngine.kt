@@ -21,6 +21,7 @@ import kotlinx.coroutines.launch
 import java.io.File
 import java.time.LocalDateTime
 import java.time.format.DateTimeFormatter
+import java.util.Locale
 import kotlin.math.max
 import kotlin.math.min
 import kotlin.random.Random
@@ -136,7 +137,8 @@ data class RaceUiState(
         )
     },
     val alertDialogMessage: String? = null,
-    val statusToastMessage: String = "Welcome to Kayak Virtual Race!"
+    val statusToastMessage: String = "Welcome to Kayak Virtual Race!",
+    val lastRaceLogPath: String? = null
 ) {
     /**
      * Returns only the configured lanes whose ergometers are currently connected (or active in-race),
@@ -155,7 +157,8 @@ class RaceEngine(
     val usbTransport: UsbHidErgoTransport = UsbHidErgoTransport(),
     val emulatedTransport: EmulatedErgoTransport = EmulatedErgoTransport(),
     private val settingsStore: RaceSettingsStore? = null,
-    defaultUseEmulator: Boolean = false
+    defaultUseEmulator: Boolean = false,
+    private val raceCommLogger: RaceCommunicationLogger? = null
 ) {
     private val scope = CoroutineScope(SupervisorJob() + Dispatchers.Default)
 
@@ -189,6 +192,7 @@ class RaceEngine(
     private val laneToUsb = IntArray(DansprintProtocol.MAX_LANES) { it }
     private val usbToLane = IntArray(DansprintProtocol.MAX_LANES) { it }
     private val discoveredLaneByUsb = IntArray(DansprintProtocol.MAX_LANES) { -1 }
+    private val discoveredSerialByUsb = arrayOfNulls<Long>(DansprintProtocol.MAX_LANES)
     private var currentDiscoveryUsbIdx: Int = 0
 
     // Per-lane internal mutable state (`0x485aac` .. `0x485d79`)
@@ -201,6 +205,8 @@ class RaceEngine(
     private val lastRxWallMs = LongArray(DansprintProtocol.MAX_LANES)
     private val lastDistance0x07SentMs = LongArray(DansprintProtocol.MAX_LANES)
     internal val laneRaceStartOffsetMs = LongArray(DansprintProtocol.MAX_LANES)
+    private val laneStaleTelemetryLogged = BooleanArray(DansprintProtocol.MAX_LANES)
+    private val laneDeltaTicksWarnLogged = BooleanArray(DansprintProtocol.MAX_LANES)
 
     // State machine timers (`0x488a1c`, `0x4882d8` .. `0x4882fa`)
     private var timerOriginWallMs: Long = System.currentTimeMillis()
@@ -260,6 +266,10 @@ class RaceEngine(
                             }
                         }
                         UsbHidErgoTransport.HotplugCheckResult.DEVICES_REMOVED -> {
+                            logRaceEvent(
+                                level = RaceLogLevel.WARN,
+                                message = "USB hotplug detected removed ergometer device(s)"
+                            )
                             updateBoxStatusAndMapping()
                         }
                         UsbHidErgoTransport.HotplugCheckResult.NO_CHANGE -> {}
@@ -283,6 +293,7 @@ class RaceEngine(
         broadcastToConnectedLanes(HostCommandOpcode.CMD_STOP_ABORT_RACE)
         broadcastToActiveLanes(HostCommandOpcode.CMD_APP_SHUTDOWN)
         disconnectErgometers()
+        endRaceCommLogSession("APP_SHUTDOWN")
         engineJob?.cancel()
         engineJob = null
     }
@@ -293,7 +304,7 @@ class RaceEngine(
     @Synchronized
     fun setUseEmulator(useEmulator: Boolean) {
         if (_uiState.value.usingEmulator == useEmulator) return
-        abortAndResetRaceInternal()
+        abortAndResetRaceInternal(endLogReason = "TRANSPORT_SWITCHED")
         disconnectErgometers()
 
         activeTransport = if (useEmulator) emulatedTransport else usbTransport
@@ -321,16 +332,28 @@ class RaceEngine(
      */
     @Synchronized
     fun connectAndDiscoverErgometers(initialStartup: Boolean = false) {
+        if (raceCommLogger?.isSessionActive == true) {
+            logRaceEvent(
+                level = RaceLogLevel.WARN,
+                message = "USB reconnect/discovery triggered during active race session"
+            )
+        }
         isMapped = false
         postConnectSend0x1AAtMs = 0L
         for (i in 0 until DansprintProtocol.MAX_LANES) {
             laneToUsb[i] = i
             usbToLane[i] = i
             discoveredLaneByUsb[i] = -1
+            discoveredSerialByUsb[i] = null
             streamParsers[i].reset()
         }
 
         val discovered = activeTransport.enumerateAndOpenDevices()
+        for (dev in discovered) {
+            if (dev.usbIndex in 0 until DansprintProtocol.MAX_LANES) {
+                discoveredSerialByUsb[dev.usbIndex] = dev.serialNumber
+            }
+        }
         val nextState = if (initialStartup) RaceState.STARTUP_DISCOVERY else RaceState.IDLE_PRE_RACE
 
         updateLanes { idx, lane ->
@@ -378,7 +401,19 @@ class RaceEngine(
         for (u in 0 until DansprintProtocol.MAX_LANES) {
             if (activeTransport.isDeviceOpen(u)) {
                 val pkt = DansprintProtocol.buildHostType1Command(HostCommandOpcode.CMD_USB_DISCONNECT)
-                activeTransport.writePacket(u, pkt, "CMD_USB_DISCONNECT (0x17)")
+                val desc = "CMD_USB_DISCONNECT (0x17)"
+                val ok = activeTransport.writePacket(u, pkt, desc)
+                val err = if (!ok) activeTransport.consumeLastIoError(u) else null
+                raceCommLogger?.logTx(
+                    stateTimerMs = elapsedTimerMs(),
+                    raceState = _uiState.value.raceState,
+                    usbIndex = u,
+                    laneNumber1Based = if (isMapped) usbToLane[u].coerceIn(0, 7) + 1 else null,
+                    packet = pkt,
+                    ok = ok,
+                    description = desc,
+                    errorDetail = err
+                )
             }
         }
         activeTransport.closeAll()
@@ -438,6 +473,7 @@ class RaceEngine(
             alertDialogMessage = null,
             statusToastMessage = "Race #$nextRaceNo ready (${current.raceDistanceMeters}m)!"
         )
+        endRaceCommLogSession("RESET_NEW_RACE")
     }
 
     /**
@@ -475,17 +511,21 @@ class RaceEngine(
         }
 
         // 4. Execute exact StartRace sequence (0x40c8fe - 0x40c924)
-        broadcastToConnectedLanes(HostCommandOpcode.CMD_START_SEQ_PREP) // 0x1D
         resetTimer()
         resetRaceRuntimeCounters()
         state1SentInitial0x07 = false
         state1LastSyncMs = 0L
         state1StillnessCount = 0
 
+        val logPath = startRaceCommLogSession(current, activeLanes)
+        logRaceStateTransition(current.raceState, RaceState.STOP_PADDLING, "Start Race sequence initiated")
+        broadcastToConnectedLanes(HostCommandOpcode.CMD_START_SEQ_PREP) // 0x1D
+
         _uiState.value = current.copy(
             raceState = RaceState.STOP_PADDLING,
             alertDialogMessage = null,
-            statusToastMessage = "START SEQUENCE: Stop paddling and wait for start position!"
+            statusToastMessage = "START SEQUENCE: Stop paddling and wait for start position!",
+            lastRaceLogPath = logPath ?: current.lastRaceLogPath
         )
 
         SoundPlayer.playCue(SoundPlayer.RaceCue.STOP_PADDLING)
@@ -501,7 +541,7 @@ class RaceEngine(
      */
     @Synchronized
     fun restartOrAbortRace() {
-        abortAndResetRaceInternal()
+        abortAndResetRaceInternal(endLogReason = "ABORTED")
         _uiState.value = _uiState.value.copy(
             statusToastMessage = "Race aborted and reset to Pre-Race Lobby."
         )
@@ -524,6 +564,7 @@ class RaceEngine(
         ) {
             return
         }
+        logRaceStateTransition(current.raceState, RaceState.FALSE_START, "Manual false start called")
         resetTimer()
         resetRaceRuntimeCounters()
         state5LastSyncMs = 0L
@@ -566,12 +607,14 @@ class RaceEngine(
         calculateFinalRankings()
         saveRaceResultsToDisk()
         broadcastToConnectedLanes(HostCommandOpcode.CMD_STOP_ABORT_RACE) // 0x12
+        logRaceStateTransition(current.raceState, RaceState.RACE_COMPLETE, "Race ended early")
         resetTimer()
 
         _uiState.value = _uiState.value.copy(
             raceState = RaceState.RACE_COMPLETE,
             statusToastMessage = "Race #${current.raceNumber} ended! Results recorded."
         )
+        endRaceCommLogSession("FINISHED_EARLY")
         SoundPlayer.playVictoryFanfare()
     }
 
@@ -691,13 +734,22 @@ class RaceEngine(
         lastType2RxMs.fill(0L)
         prevType2RxMs.fill(0L)
         laneRaceStartOffsetMs.fill(0L)
+        laneStaleTelemetryLogged.fill(false)
+        laneDeltaTicksWarnLogged.fill(false)
         lastLeaderBroadcastMs = 0L
         leaderBroadcastRoundRobinLane = 0
         leaderFinishedBroadcastTicks = 0
     }
 
-    private fun abortAndResetRaceInternal() {
+    private fun abortAndResetRaceInternal(endLogReason: String = "ABORTED") {
+        val previousState = _uiState.value.raceState
+        val finalLanesSnapshot = _uiState.value.lanes
+        val configuredCount = _uiState.value.configuredLanesCount
         broadcastToConnectedLanes(HostCommandOpcode.CMD_STOP_ABORT_RACE) // 0x12
+        if (raceCommLogger?.isSessionActive == true) {
+            logRaceStateTransition(previousState, RaceState.IDLE_PRE_RACE, endLogReason)
+            raceCommLogger.endRaceSession(endLogReason, finalLanesSnapshot, configuredCount)
+        }
         recalculateCourseViewZoom(_uiState.value.raceDistanceMeters)
         resetRaceRuntimeCounters()
 
@@ -757,7 +809,7 @@ class RaceEngine(
         }
     }
 
-    private fun pollAllIncomingStreams() {
+    internal fun pollAllIncomingStreams() {
         for (usbIdx in 0 until DansprintProtocol.MAX_LANES) {
             if (activeTransport.isDeviceOpen(usbIdx)) {
                 pollIncomingForDevice(usbIdx)
@@ -769,14 +821,35 @@ class RaceEngine(
         // Drain up to 8 queued HID input reports per 25ms tick so bursts never lag behind
         for (reads in 0 until 8) {
             val bytes = activeTransport.readNonBlocking(usbIdx)
-            if (bytes.isEmpty()) return
+            val laneIdx = if (isMapped) usbToLane[usbIdx].coerceIn(0, 7) else usbIdx
+            val lane1Based = if (isMapped) laneIdx + 1 else null
+            if (bytes.isEmpty()) {
+                val ioErr = activeTransport.consumeLastIoError(usbIdx)
+                if (ioErr != null) {
+                    logRaceEvent(
+                        level = RaceLogLevel.ERR,
+                        usbIdx = usbIdx,
+                        laneIdx = if (isMapped) laneIdx else null,
+                        message = "USB RX I/O error: $ioErr"
+                    )
+                }
+                return
+            }
 
             // Translate USB device index -> Logical Lane index when mapped (0x405c3c)
-            val laneIdx = if (isMapped) usbToLane[usbIdx].coerceIn(0, 7) else usbIdx
-            val packets = streamParsers[laneIdx].feedBytes(bytes)
+            val parseResult = streamParsers[laneIdx].feedBytesDetailed(bytes)
             val nowMs = elapsedTimerMs()
 
-            for (pkt in packets) {
+            raceCommLogger?.logRx(
+                stateTimerMs = nowMs,
+                raceState = _uiState.value.raceState,
+                usbIndex = usbIdx,
+                laneNumber1Based = lane1Based,
+                rawBytes = bytes,
+                parseResult = parseResult
+            )
+
+            for (pkt in parseResult.packets) {
                 lastRxWallMs[laneIdx] = System.currentTimeMillis()
                 handleIncomingPacket(usbIdx, laneIdx, pkt, nowMs)
             }
@@ -794,6 +867,13 @@ class RaceEngine(
         when (pkt) {
             is IncomingErgoPacket.PowerReappliedRead -> {
                 // 0x405d3f: "READ" received -> power was cycled on ergometer
+                logRaceEvent(
+                    level = RaceLogLevel.WARN,
+                    usbIdx = usbIdx,
+                    laneIdx = laneIdx,
+                    message = "Power reapplied (\"READ\") - lane marked disconnected and inactive",
+                    timerMs = nowTimerMs
+                )
                 updateSingleLane(laneIdx) {
                     it.copy(
                         powerReapplied = true,
@@ -806,6 +886,13 @@ class RaceEngine(
 
             is IncomingErgoPacket.ConnectResetReply -> {
                 // 0x405a6f: Opcode 0x00 reset/power-reapplied reply
+                logRaceEvent(
+                    level = RaceLogLevel.WARN,
+                    usbIdx = usbIdx,
+                    laneIdx = laneIdx,
+                    message = "Ergometer reset reply (Opcode 0x00) - lane marked disconnected and inactive",
+                    timerMs = nowTimerMs
+                )
                 updateSingleLane(laneIdx) {
                     it.copy(
                         powerReapplied = true,
@@ -858,8 +945,23 @@ class RaceEngine(
                     val raceDist = _uiState.value.raceDistanceMeters.toFloat()
                     val alreadyFinished = _uiState.value.lanes[laneIdx].isFinished
                     if (!alreadyFinished) {
+                        logRaceEvent(
+                            level = RaceLogLevel.OK,
+                            usbIdx = usbIdx,
+                            laneIdx = laneIdx,
+                            message = String.format(
+                                Locale.US,
+                                "Official finish recorded: time=%.2fms (%s), dist=%.2fm",
+                                pkt.finishTimeMs,
+                                DansprintProtocol.formatRaceTimeMs(pkt.finishTimeMs),
+                                raceDist
+                            ),
+                            timerMs = nowTimerMs
+                        )
                         speedFifoCount[laneIdx] = 0
                         boostTrackers[laneIdx].reset()
+                        laneStaleTelemetryLogged[laneIdx] = false
+                        laneDeltaTicksWarnLogged[laneIdx] = false
                         updateSingleLane(laneIdx) {
                             it.copy(
                                 finishTimeMs = pkt.finishTimeMs,
@@ -886,6 +988,16 @@ class RaceEngine(
             is IncomingErgoPacket.ReadyActiveType3 -> {
                 // 0x405ec7: Type 3 (FF FF FF FE) Ready / Distance-Ack / Active
                 if (isMapped) {
+                    if (state == RaceState.RACE_START_HOLD || state == RaceState.RACING) {
+                        logRaceEvent(
+                            level = RaceLogLevel.WARN,
+                            usbIdx = usbIdx,
+                            laneIdx = laneIdx,
+                            message = "Unexpected Type3[FE] received during ${state.name} (status=0x%04X, weight=%dkg) - resets rawDistance & speed to 0"
+                                .format(Locale.US, pkt.statusWord, pkt.weightKg),
+                            timerMs = nowTimerMs
+                        )
+                    }
                     if (state == RaceState.IDLE_PRE_RACE || state == RaceState.STARTUP_DISCOVERY) {
                         val currentLane = _uiState.value.lanes[laneIdx]
                         if (!currentLane.active || nowTimerMs - lastDistance0x07SentMs[laneIdx] > 1_000L) {
@@ -913,6 +1025,23 @@ class RaceEngine(
                 // 0x405d6e: Type 2 (FF FF FF FC) Real-Time Race Telemetry
                 if (state == RaceState.RACE_START_HOLD || state == RaceState.RACING) {
                     if (pkt.distanceMeters != prevType2Distance[laneIdx]) {
+                        if (laneStaleTelemetryLogged[laneIdx]) {
+                            val gapMs = nowTimerMs - lastType2RxMs[laneIdx]
+                            laneStaleTelemetryLogged[laneIdx] = false
+                            logRaceEvent(
+                                level = RaceLogLevel.OK,
+                                usbIdx = usbIdx,
+                                laneIdx = laneIdx,
+                                message = String.format(
+                                    Locale.US,
+                                    "Telemetry resumed after %dms stale gap (dist=%.2fm, speed=%.2fkm/h)",
+                                    gapMs,
+                                    pkt.distanceMeters,
+                                    pkt.speedKmh
+                                ),
+                                timerMs = nowTimerMs
+                            )
+                        }
                         prevType2Distance[laneIdx] = pkt.distanceMeters
                         prevType2RxMs[laneIdx] = lastType2RxMs[laneIdx]
                         lastType2RxMs[laneIdx] = nowTimerMs
@@ -933,6 +1062,20 @@ class RaceEngine(
                                 )
                             }
                         }
+                    } else {
+                        logRaceEvent(
+                            level = RaceLogLevel.WARN,
+                            usbIdx = usbIdx,
+                            laneIdx = laneIdx,
+                            message = String.format(
+                                Locale.US,
+                                "Type2 telemetry ignored: unchanged distance=%.2fm (speed=%.2fkm/h, ticks=%d)",
+                                pkt.distanceMeters,
+                                pkt.speedKmh,
+                                pkt.ergoTicks
+                            ),
+                            timerMs = nowTimerMs
+                        )
                     }
                 }
             }
@@ -984,6 +1127,11 @@ class RaceEngine(
             if (isMapped) {
                 if (matchCount > 1) {
                     // Duplicate lane conflict detected! Reset to unmapped (0x40643e)
+                    logRaceEvent(
+                        level = RaceLogLevel.WARN,
+                        laneIdx = laneIdx,
+                        message = "Duplicate lane conflict detected ($matchCount devices) - resetting lane mapping"
+                    )
                     isMapped = false
                     for (i in 0 until DansprintProtocol.MAX_LANES) {
                         laneToUsb[i] = i
@@ -1003,6 +1151,14 @@ class RaceEngine(
                     else -> BoxStatusColor.GREEN_CONNECTED
                 }
                 val isConn = matchCount == 1 && handleOpen && !laneState.powerReapplied
+                if (laneState.connected && !isConn) {
+                    logRaceEvent(
+                        level = RaceLogLevel.WARN,
+                        usbIdx = usbIdx,
+                        laneIdx = laneIdx,
+                        message = "Lane connection lost (boxStatus=${color.name}, handleOpen=$handleOpen, matchCount=$matchCount)"
+                    )
+                }
                 val inPreRaceLobby = current.raceState == RaceState.IDLE_PRE_RACE ||
                     current.raceState == RaceState.STARTUP_DISCOVERY
                 updateSingleLane(laneIdx) {
@@ -1039,7 +1195,19 @@ class RaceEngine(
             for (u in 0 until DansprintProtocol.MAX_LANES) {
                 if (activeTransport.isDeviceOpen(u) && discoveredLaneByUsb[u] < 0) {
                     val pkt = DansprintProtocol.buildHostType1Command(HostCommandOpcode.CMD_POLL_STATUS)
-                    activeTransport.writePacket(u, pkt, "CMD_POLL_STATUS (discovery retry)")
+                    val desc = "CMD_POLL_STATUS (discovery retry)"
+                    val ok = activeTransport.writePacket(u, pkt, desc)
+                    val err = if (!ok) activeTransport.consumeLastIoError(u) else null
+                    raceCommLogger?.logTx(
+                        stateTimerMs = elapsedTimerMs(),
+                        raceState = current.raceState,
+                        usbIndex = u,
+                        laneNumber1Based = null,
+                        packet = pkt,
+                        ok = ok,
+                        description = desc,
+                        errorDetail = err
+                    )
                 }
             }
         }
@@ -1123,6 +1291,7 @@ class RaceEngine(
                         state1StillnessCount++
                         if (state1StillnessCount > 2) {
                             // Transition State 1 -> State 2 (`START_POSITION`) (0x404ae4)
+                            logRaceStateTransition(RaceState.STOP_PADDLING, RaceState.START_POSITION, "All active paddles still")
                             state1StillnessCount = 0
                             state2LastSyncMs = 0L
                             resetTimer()
@@ -1160,6 +1329,11 @@ class RaceEngine(
                 state3StartSignalSubstate = 0
                 state3Sent500ms0x07 = false
                 state3LastSyncMs = 0L
+                logRaceStateTransition(
+                    RaceState.START_POSITION,
+                    RaceState.READY_COUNTDOWN,
+                    "randDelayMs=$state3RandDelayMs (gate at ${state3RandDelayMs + 1_800L}ms)"
+                )
 
                 updateLanes { _, lane -> lane.copy(readyAck = false) }
                 resetTimer()
@@ -1203,6 +1377,7 @@ class RaceEngine(
                         state3StartSignalSubstate = 2
                     } else {
                         // Fire Race Start signal and enter State 4!
+                        logRaceStateTransition(RaceState.READY_COUNTDOWN, RaceState.RACE_START_HOLD, "Gunshot / Race Start")
                         SoundPlayer.playCue(SoundPlayer.RaceCue.RACE_START)
                         _uiState.value = _uiState.value.copy(
                             raceState = RaceState.RACE_START_HOLD,
@@ -1217,11 +1392,18 @@ class RaceEngine(
                 if (nowMs >= state3RandDelayMs + 1_800L && state3StartSignalSubstate == 0) {
                     broadcastToActiveLanes(HostCommandOpcode.CMD_START_SEQ_SYNC) // 0x10
                     // Capture per-lane time offset (`0x404dc4`)
+                    val offsetParts = mutableListOf<String>()
                     for (i in 0 until numLanes) {
                         if (_uiState.value.lanes[i].active) {
                             laneRaceStartOffsetMs[i] = (nowMs - lastDistance0x07SentMs[i]).coerceAtLeast(0L)
+                            offsetParts.add("L${i + 1}=${laneRaceStartOffsetMs[i]}ms")
                         }
                     }
+                    logRaceEvent(
+                        level = RaceLogLevel.OK,
+                        message = "Gunshot 0x07->0x0A offsets captured: ${offsetParts.joinToString(", ")}",
+                        timerMs = nowMs
+                    )
                     resetTimer()
                     broadcastRaceStart0x0A()
                     state3StartSignalSubstate = 2
@@ -1238,6 +1420,7 @@ class RaceEngine(
                 // State 4 (`0x404f90`): Hold for 1500ms after race start signal, then enter State 6 (`RACING`)
                 updateRacingInterpolation(nowMs, numLanes)
                 if (nowMs > 1_500L) {
+                    logRaceStateTransition(RaceState.RACE_START_HOLD, RaceState.RACING, "Start hold elapsed")
                     _uiState.value = _uiState.value.copy(
                         raceState = RaceState.RACING,
                         elapsedTimerMs = nowMs,
@@ -1271,6 +1454,12 @@ class RaceEngine(
                         lane.copy(falseStartFlag = false)
                     } else if (lane.falseStartCount > 1) {
                         // 2nd false start -> Disqualified! (`0x404ef4`: active = 0, rank = 999 / 0x3E7)
+                        logRaceEvent(
+                            level = RaceLogLevel.WARN,
+                            laneIdx = lane.laneIndex,
+                            message = "Lane ${lane.laneNumber1Based} disqualified (DSQ) after ${lane.falseStartCount} false starts",
+                            timerMs = nowMs
+                        )
                         lane.copy(
                             active = false,
                             disqualified = true,
@@ -1289,13 +1478,14 @@ class RaceEngine(
 
                 val remainingActive = _uiState.value.lanes.take(numLanes).any { it.active }
                 if (!remainingActive) {
-                    abortAndResetRaceInternal()
+                    abortAndResetRaceInternal(endLogReason = "ALL_LANES_DISQUALIFIED")
                     _uiState.value = _uiState.value.copy(
                         statusToastMessage = "All active lanes disqualified after 2 false starts."
                     )
                     return
                 }
 
+                logRaceStateTransition(RaceState.FALSE_START, nextState, "Restarting start sequence")
                 resetTimer()
                 _uiState.value = _uiState.value.copy(
                     raceState = nextState,
@@ -1322,6 +1512,7 @@ class RaceEngine(
                 if (activeLanes.isNotEmpty() && activeLanes.all { it.finishTimeMs > 0.0f }) {
                     calculateFinalRankings()
                     saveRaceResultsToDisk()
+                    logRaceStateTransition(RaceState.RACING, RaceState.POST_FINISH, "All active lanes finished")
                     resetTimer()
                     _uiState.value = _uiState.value.copy(
                         raceState = RaceState.POST_FINISH,
@@ -1336,10 +1527,12 @@ class RaceEngine(
                 broadcastLeaderProgressIfDue(nowMs, numLanes)
                 if (nowMs > 2_000L) {
                     broadcastToConnectedLanes(HostCommandOpcode.CMD_STOP_ABORT_RACE) // 0x12
+                    logRaceStateTransition(RaceState.POST_FINISH, RaceState.RACE_COMPLETE, "Post-finish hold complete")
                     _uiState.value = _uiState.value.copy(
                         raceState = RaceState.RACE_COMPLETE,
                         statusToastMessage = "Race #${current.raceNumber} Complete! Press New Race for the next heat."
                     )
+                    endRaceCommLogSession("COMPLETED")
                 }
             }
         }
@@ -1352,6 +1545,7 @@ class RaceEngine(
     private fun checkAndTriggerFalseStart(numLanes: Int): Boolean {
         val currentLanes = _uiState.value.lanes
         var offenderLane1Based: Int? = null
+        val offenderDetails = mutableListOf<String>()
 
         val updated = currentLanes.mapIndexed { idx, lane ->
             if (idx < numLanes &&
@@ -1360,8 +1554,19 @@ class RaceEngine(
                 lane.flywheelMetric > DansprintProtocol.FALSE_START_FLYWHEEL_THRESHOLD
             ) {
                 offenderLane1Based = lane.laneNumber1Based
+                val nextCount = lane.falseStartCount + 1
+                offenderDetails.add(
+                    String.format(
+                        Locale.US,
+                        "L%d(metric=%.1f, pulseAge=%dms, strike=%d)",
+                        lane.laneNumber1Based,
+                        lane.flywheelMetric,
+                        lane.msSincePulse,
+                        nextCount
+                    )
+                )
                 lane.copy(
-                    falseStartCount = lane.falseStartCount + 1,
+                    falseStartCount = nextCount,
                     falseStartFlag = true
                 )
             } else {
@@ -1370,6 +1575,12 @@ class RaceEngine(
         }
 
         if (offenderLane1Based != null) {
+            logRaceEvent(
+                level = RaceLogLevel.WARN,
+                laneIdx = offenderLane1Based - 1,
+                message = "Automatic false start detected: ${offenderDetails.joinToString(", ")}"
+            )
+            logRaceStateTransition(RaceState.READY_COUNTDOWN, RaceState.FALSE_START, offenderDetails.joinToString(", "))
             resetTimer()
             state5LastSyncMs = 0L
             _uiState.value = _uiState.value.copy(
@@ -1410,6 +1621,24 @@ class RaceEngine(
                 val packetInterval = (lastType2RxMs[idx] - prevType2RxMs[idx]).coerceAtLeast(50L)
                 val staleSpeed = timeSinceLastRx > packetInterval * 4L && timeSinceLastRx > 2_000L
 
+                if (staleSpeed && !laneStaleTelemetryLogged[idx]) {
+                    laneStaleTelemetryLogged[idx] = true
+                    logRaceEvent(
+                        level = RaceLogLevel.WARN,
+                        usbIdx = if (isMapped) laneToUsb[idx] else idx,
+                        laneIdx = idx,
+                        message = String.format(
+                            Locale.US,
+                            "Stale telemetry timeout: sinceLastRx=%dms, pktInterval=%dms, rawDist=%.2fm, interpDist=%.2fm",
+                            timeSinceLastRx,
+                            packetInterval,
+                            lane.rawDistanceMeters,
+                            lane.interpolatedDistanceMeters
+                        ),
+                        timerMs = nowMs
+                    )
+                }
+
                 val effectiveSpeedMPerTick = if (staleSpeed) 0f else lane.speedMetersPerTick
                 val effectiveDisplayedKmh = if (staleSpeed) {
                     speedFifoCount[idx] = 0
@@ -1431,7 +1660,37 @@ class RaceEngine(
                 val hostTicks = nowMs * DansprintProtocol.ERGO_TICKS_PER_MS
                 val adjustedErgoTicks = lane.ergoTicks - laneRaceStartOffsetMs[idx] * DansprintProtocol.ERGO_TICKS_PER_MS
                 val deltaTicks = hostTicks - adjustedErgoTicks
-                val interpDist = if (deltaTicks in 0L until 1_500_000L) {
+                val deltaInRange = deltaTicks in 0L until 1_500_000L
+                if (!staleSpeed && lane.ergoTicks > 0L) {
+                    if (!deltaInRange && !laneDeltaTicksWarnLogged[idx]) {
+                        laneDeltaTicksWarnLogged[idx] = true
+                        logRaceEvent(
+                            level = RaceLogLevel.WARN,
+                            usbIdx = if (isMapped) laneToUsb[idx] else idx,
+                            laneIdx = idx,
+                            message = String.format(
+                                Locale.US,
+                                "Dead-reckoning deltaTicks out of range: deltaTicks=%d (hostTicks=%d, ergoTicks=%d, offsetMs=%d), using rawDist=%.2fm",
+                                deltaTicks,
+                                hostTicks,
+                                lane.ergoTicks,
+                                laneRaceStartOffsetMs[idx],
+                                lane.rawDistanceMeters
+                            ),
+                            timerMs = nowMs
+                        )
+                    } else if (deltaInRange && laneDeltaTicksWarnLogged[idx]) {
+                        laneDeltaTicksWarnLogged[idx] = false
+                        logRaceEvent(
+                            level = RaceLogLevel.OK,
+                            usbIdx = if (isMapped) laneToUsb[idx] else idx,
+                            laneIdx = idx,
+                            message = "Dead-reckoning deltaTicks back in range: deltaTicks=$deltaTicks",
+                            timerMs = nowMs
+                        )
+                    }
+                }
+                val interpDist = if (deltaInRange) {
                     lane.rawDistanceMeters + deltaTicks.toFloat() * effectiveSpeedMPerTick
                 } else {
                     lane.rawDistanceMeters
@@ -1660,9 +1919,100 @@ class RaceEngine(
         // Matches 0x40e0cc: when isMapped == true, translate logical lane -> USB index via laneToUsb
         val usbIdx = if (isMapped) laneToUsb[laneIndex] else laneIndex
         val ok = activeTransport.writePacket(usbIdx, packet, description)
+        val err = if (!ok) activeTransport.consumeLastIoError(usbIdx) else null
+        raceCommLogger?.logTx(
+            stateTimerMs = elapsedTimerMs(),
+            raceState = _uiState.value.raceState,
+            usbIndex = usbIdx,
+            laneNumber1Based = if (isMapped) laneIndex + 1 else null,
+            packet = packet,
+            ok = ok,
+            description = description,
+            errorDetail = err
+        )
         if (!ok && isMapped) {
             updateSingleLane(laneIndex) { it.copy(connected = false) }
         }
+    }
+
+    private fun startRaceCommLogSession(
+        current: RaceUiState,
+        activeLanes: List<LaneTelemetryState>
+    ): String? {
+        val logger = raceCommLogger ?: return null
+        val mappings = current.lanes.take(current.configuredLanesCount)
+            .filter { it.connected || it.active }
+            .map { lane ->
+                val usbIdx = if (isMapped) laneToUsb[lane.laneIndex] else lane.laneIndex
+                RaceLogLaneMappingEntry(
+                    laneNumber1Based = lane.laneNumber1Based,
+                    usbIndex = usbIdx,
+                    serialNumber = discoveredSerialByUsb.getOrNull(usbIdx),
+                    connected = lane.connected,
+                    active = lane.active,
+                    weightKg = lane.weightKg
+                )
+            }
+        val metadata = RaceLogMetadata(
+            raceNumber = current.raceNumber,
+            raceDistanceMeters = current.raceDistanceMeters,
+            configuredLanesCount = current.configuredLanesCount,
+            transportModeName = activeTransport.modeName,
+            isEmulated = activeTransport.isEmulated,
+            isMapped = isMapped,
+            laneMappings = mappings
+        )
+        val logFile = logger.startRaceSession(metadata)
+        val activeLaneNums = activeLanes.map { it.laneNumber1Based }
+        logger.logEvent(
+            stateTimerMs = 0L,
+            raceState = current.raceState,
+            level = RaceLogLevel.OK,
+            message = "Race session opened: Race #${current.raceNumber}, ${current.raceDistanceMeters}m, activeLanes=$activeLaneNums"
+        )
+        return logFile?.path
+    }
+
+    private fun endRaceCommLogSession(reason: String) {
+        val logger = raceCommLogger ?: return
+        if (!logger.isSessionActive) return
+        val current = _uiState.value
+        logger.logEvent(
+            stateTimerMs = elapsedTimerMs(),
+            raceState = current.raceState,
+            level = RaceLogLevel.OK,
+            message = "Race session closing: reason=$reason"
+        )
+        logger.endRaceSession(
+            reason = reason,
+            finalLanes = current.lanes,
+            configuredLanesCount = current.configuredLanesCount
+        )
+    }
+
+    private fun logRaceStateTransition(from: RaceState, to: RaceState, detail: String = "") {
+        val suffix = if (detail.isNotBlank()) " ($detail)" else ""
+        logRaceEvent(
+            level = if (to == RaceState.FALSE_START) RaceLogLevel.WARN else RaceLogLevel.OK,
+            message = "State transition: ${from.name} -> ${to.name}$suffix"
+        )
+    }
+
+    private fun logRaceEvent(
+        level: RaceLogLevel = RaceLogLevel.OK,
+        usbIdx: Int? = null,
+        laneIdx: Int? = null,
+        message: String,
+        timerMs: Long = elapsedTimerMs()
+    ) {
+        raceCommLogger?.logEvent(
+            stateTimerMs = timerMs,
+            raceState = _uiState.value.raceState,
+            level = level,
+            usbIndex = usbIdx,
+            laneNumber1Based = laneIdx?.let { it + 1 },
+            message = message
+        )
     }
 
     private fun resetTimer() {

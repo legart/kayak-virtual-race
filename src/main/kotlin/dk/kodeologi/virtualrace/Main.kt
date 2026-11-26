@@ -7,12 +7,18 @@ import androidx.compose.ui.unit.dp
 import androidx.compose.ui.window.Window
 import androidx.compose.ui.window.application
 import androidx.compose.ui.window.rememberWindowState
+import dk.kodeologi.virtualrace.engine.FileRaceCommunicationLogger
 import dk.kodeologi.virtualrace.engine.FileRaceSettingsStore
 import dk.kodeologi.virtualrace.engine.RaceEngine
 import dk.kodeologi.virtualrace.web.RaceWebServer
 
 fun main() = application {
-    val engine = remember { RaceEngine(settingsStore = FileRaceSettingsStore()) }
+    val engine = remember {
+        RaceEngine(
+            settingsStore = FileRaceSettingsStore(),
+            raceCommLogger = FileRaceCommunicationLogger()
+        )
+    }
     val webServer = remember { RaceWebServer(engine) }
 
     DisposableEffect(Unit) {

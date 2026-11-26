@@ -1,6 +1,7 @@
 .gradle
 build
 results
+logs
 *.msi
 .idea
 .kotlin

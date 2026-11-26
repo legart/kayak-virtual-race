@@ -2,6 +2,7 @@ package dk.kodeologi.virtualrace.protocol
 
 import java.nio.ByteBuffer
 import java.nio.ByteOrder
+import java.util.Locale
 import kotlin.math.min
 import kotlin.math.roundToLong
 
@@ -210,6 +211,78 @@ object DansprintProtocol {
         return (0 until count).joinToString(" ") { "%02X".format(this[it].toInt() and 0xFF) } +
             if (this.size > maxBytes) " ..." else ""
     }
+
+    /**
+     * Decodes a Host -> Ergometer binary packet into a detailed human-readable summary for race debug logs.
+     */
+    fun decodeHostPacketSummary(packet: ByteArray): String {
+        if (packet.size >= 4 &&
+            packet[0] == 0xFF.toByte() &&
+            packet[1] == 0xFF.toByte() &&
+            packet[2] == 0xFF.toByte()
+        ) {
+            return when (packet[3]) {
+                0xFB.toByte() -> {
+                    if (packet.size < 4 + TYPE1_PAYLOAD_LEN) {
+                        "Type1[FB Truncated len=${packet.size}]"
+                    } else {
+                        val bb = ByteBuffer.wrap(packet, 4, TYPE1_PAYLOAD_LEN).order(ByteOrder.LITTLE_ENDIAN)
+                        val opcodeCode = packet[4 + 22].toInt() and 0xFF
+                        val opcode = HostCommandOpcode.fromCode(opcodeCode)
+                        val checksumOk = verifyChecksum(packet, 4, TYPE1_PAYLOAD_LEN)
+                        val chkTag = if (checksumOk) "" else " [BAD_CHECKSUM]"
+                        when (opcode) {
+                            HostCommandOpcode.CMD_SET_DISTANCE -> {
+                                val dist = bb.getFloat(4)
+                                String.format(
+                                    Locale.US,
+                                    "Type1[0x07 CMD_SET_DISTANCE] dist=%.2fm, flag20=0x%02X%s",
+                                    dist,
+                                    packet[4 + 20].toInt() and 0xFF,
+                                    chkTag
+                                )
+                            }
+                            HostCommandOpcode.CMD_RACE_START -> {
+                                val startMs = bb.getFloat(4 + 12)
+                                String.format(
+                                    Locale.US,
+                                    "Type1[0x0A CMD_RACE_START] startTimer=%.1fms%s",
+                                    startMs,
+                                    chkTag
+                                )
+                            }
+                            null -> String.format(Locale.US, "Type1[0x%02X UNKNOWN_HOST_CMD]%s", opcodeCode, chkTag)
+                            else -> String.format(Locale.US, "Type1[0x%02X %s]%s", opcodeCode, opcode.name, chkTag)
+                        }
+                    }
+                }
+                0xFC.toByte() -> {
+                    if (packet.size < 4 + TYPE2_PAYLOAD_LEN) {
+                        "Type2[FC Truncated len=${packet.size}]"
+                    } else {
+                        val bb = ByteBuffer.wrap(packet, 4, TYPE2_PAYLOAD_LEN).order(ByteOrder.LITTLE_ENDIAN)
+                        val ticks = bb.getInt(4).toLong() and 0xFFFFFFFFL
+                        val speedMPerTick = bb.getFloat(4 + 4)
+                        val dist = bb.getFloat(4 + 8)
+                        val speedKmh = speedMetersPerTickToKmh(speedMPerTick)
+                        val checksumOk = verifyChecksum(packet, 4, TYPE2_PAYLOAD_LEN)
+                        val chkTag = if (checksumOk) "" else " [BAD_CHECKSUM]"
+                        String.format(
+                            Locale.US,
+                            "Type2[FC LeaderBroadcast] dist=%.2fm, speed=%.2fkm/h (%.8fm/tick), ticks=%d%s",
+                            dist,
+                            speedKmh,
+                            speedMPerTick,
+                            ticks,
+                            chkTag
+                        )
+                    }
+                }
+                else -> String.format(Locale.US, "HostFrame[sync=0x%02X len=%d]", packet[3].toInt() and 0xFF, packet.size)
+            }
+        }
+        return "RawHostBytes[len=${packet.size}]"
+    }
 }
 
 /**
@@ -240,6 +313,7 @@ enum class HostCommandOpcode(val code: Int, val label: String) {
  */
 sealed interface IncomingErgoPacket {
     val summary: String
+    val debugSummary: String get() = summary
 
     /** Type 1 Opcode 0x10: Flywheel period & time since last pulse (0x405a94) */
     data class StrokeActivity(
@@ -250,6 +324,16 @@ sealed interface IncomingErgoPacket {
     ) : IncomingErgoPacket {
         override val summary: String
             get() = "Type1[0x10 Stroke] metric=%.1f, pulseAge=%dms".format(flywheelMetric, msSincePulse)
+
+        override val debugSummary: String
+            get() = String.format(
+                Locale.US,
+                "Type1[0x10 Stroke] metric=%.2f, pulseAge=%dms, periodTicks=%.2f, ticksSincePulse=%d",
+                flywheelMetric,
+                msSincePulse,
+                flywheelPeriodTicks,
+                ticksSincePulse
+            )
     }
 
     /** Type 1 Opcode 0x08: Official finish time in ms (in State 6) or distance request (in States 1/2) (0x405b00) */
@@ -258,6 +342,14 @@ sealed interface IncomingErgoPacket {
     ) : IncomingErgoPacket {
         override val summary: String
             get() = "Type1[0x08 Finish/Ack] finishTime=%.1fms (%s)".format(
+                finishTimeMs,
+                DansprintProtocol.formatRaceTimeMs(finishTimeMs)
+            )
+
+        override val debugSummary: String
+            get() = String.format(
+                Locale.US,
+                "Type1[0x08 Finish/Ack] finishTime=%.2fms (%s)",
                 finishTimeMs,
                 DansprintProtocol.formatRaceTimeMs(finishTimeMs)
             )
@@ -308,6 +400,16 @@ sealed interface IncomingErgoPacket {
                 speedKmh,
                 ergoTicks
             )
+
+        override val debugSummary: String
+            get() = String.format(
+                Locale.US,
+                "Type2[FC Telemetry] dist=%.2fm, speed=%.2fkm/h (%.8fm/tick), ticks=%d",
+                distanceMeters,
+                speedKmh,
+                speedMetersPerTick,
+                ergoTicks
+            )
     }
 
     /** Type 3 (FF FF FF FE): Ergometer Ready / Distance Ack / Active (0x405ec7) */
@@ -317,12 +419,31 @@ sealed interface IncomingErgoPacket {
     ) : IncomingErgoPacket {
         override val summary: String
             get() = "Type3[FE Ready/Active] weight=${weightKg}kg"
+
+        override val debugSummary: String
+            get() = String.format(Locale.US, "Type3[FE Ready/Active] status=0x%04X, weight=%dkg", statusWord, weightKg)
     }
 
     /** Raw 4-byte ASCII "READ" power-reapplied marker (0x405d3f) */
     data object PowerReappliedRead : IncomingErgoPacket {
         override val summary: String = "Marker[\"READ\" Power Reapplied]"
     }
+}
+
+/**
+ * Detailed result returned by [ErgoStreamParser.feedBytesDetailed], exposing decoded frames
+ * along with wire-level diagnostics (checksum mismatches, buffer overflows, discarded bytes,
+ * and remaining partial-frame bytes) for race communication debugging.
+ */
+data class ErgoStreamParseResult(
+    val packets: List<IncomingErgoPacket>,
+    val checksumFailures: List<String> = emptyList(),
+    val bufferOverflowCount: Int = 0,
+    val discardedGarbageBytes: Int = 0,
+    val bufferedBytesRemaining: Int = 0
+) {
+    val hasIssues: Boolean
+        get() = checksumFailures.isNotEmpty() || bufferOverflowCount > 0
 }
 
 /**
@@ -342,12 +463,25 @@ class ErgoStreamParser {
      * Appends incoming USB HID bytes to the 200-byte stream buffer and parses all complete frames.
      */
     fun feedBytes(incoming: ByteArray, length: Int = incoming.size): List<IncomingErgoPacket> {
+        return feedBytesDetailed(incoming, length).packets
+    }
+
+    /**
+     * Appends incoming USB HID bytes to the 200-byte stream buffer, parses all complete frames,
+     * and returns full parse diagnostics for communication logging.
+     */
+    fun feedBytesDetailed(incoming: ByteArray, length: Int = incoming.size): ErgoStreamParseResult {
         val parsed = mutableListOf<IncomingErgoPacket>()
+        val checksumFailures = mutableListOf<String>()
+        var bufferOverflowCount = 0
+        var discardedGarbageBytes = 0
+
         for (i in 0 until min(length, incoming.size)) {
             if (bufferedLength < DansprintProtocol.STREAM_BUFFER_CAPACITY) {
                 buffer[bufferedLength++] = incoming[i]
             } else {
                 // Matches 0x405c89: if buffer reaches 200 bytes without being drained, reset index to 0
+                bufferOverflowCount++
                 bufferedLength = 0
             }
         }
@@ -421,6 +555,9 @@ class ErgoStreamParser {
                             parsed.add(IncomingErgoPacket.RaceTelemetryType2(ticks, speed, dist))
                             consumeBytes = syncOffset + DansprintProtocol.HID_INPUT_REPORT_CONSUME_BYTES
                         } else {
+                            checksumFailures.add(
+                                formatChecksumFailure("Type2(FC)", payloadStart, DansprintProtocol.TYPE2_PAYLOAD_LEN)
+                            )
                             consumeBytes = syncOffset + 4
                         }
                     }
@@ -431,6 +568,9 @@ class ErgoStreamParser {
                             parsed.add(decodeType1Payload(buffer, payloadStart))
                             consumeBytes = syncOffset + DansprintProtocol.HID_INPUT_REPORT_CONSUME_BYTES
                         } else {
+                            checksumFailures.add(
+                                formatChecksumFailure("Type1(FB)", payloadStart, DansprintProtocol.TYPE1_PAYLOAD_LEN)
+                            )
                             consumeBytes = syncOffset + 4
                         }
                     }
@@ -445,6 +585,9 @@ class ErgoStreamParser {
                             parsed.add(IncomingErgoPacket.ReadyActiveType3(statusWord, weightKg))
                             consumeBytes = syncOffset + DansprintProtocol.HID_INPUT_REPORT_CONSUME_BYTES
                         } else {
+                            checksumFailures.add(
+                                formatChecksumFailure("Type3(FE)", payloadStart, DansprintProtocol.TYPE3_PAYLOAD_LEN)
+                            )
                             consumeBytes = syncOffset + 4
                         }
                     }
@@ -452,6 +595,7 @@ class ErgoStreamParser {
                 0 -> {
                     if (bufferedLength > 4) {
                         consumeBytes = bufferedLength - 4
+                        discardedGarbageBytes += consumeBytes
                     }
                 }
             }
@@ -472,7 +616,21 @@ class ErgoStreamParser {
             }
         }
 
-        return parsed
+        return ErgoStreamParseResult(
+            packets = parsed,
+            checksumFailures = checksumFailures,
+            bufferOverflowCount = bufferOverflowCount,
+            discardedGarbageBytes = discardedGarbageBytes,
+            bufferedBytesRemaining = bufferedLength
+        )
+    }
+
+    private fun formatChecksumFailure(typeLabel: String, payloadStart: Int, payloadLen: Int): String {
+        val expected = DansprintProtocol.calculateChecksum(buffer, payloadStart, payloadLen)
+        val low = buffer[payloadStart + payloadLen - 2].toInt() and 0xFF
+        val high = buffer[payloadStart + payloadLen - 1].toInt() and 0xFF
+        val actual = low or (high shl 8)
+        return String.format(Locale.US, "%s checksum mismatch (expected=0x%04X, actual=0x%04X)", typeLabel, expected, actual)
     }
 
     private fun decodeType1Payload(buf: ByteArray, offset: Int): IncomingErgoPacket {

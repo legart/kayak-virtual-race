@@ -12,7 +12,7 @@ A modern, cross-platform desktop application (Kotlin + Compose Multiplatform Des
 - **Built-in Wire-Level Emulator**: Test and race without physical hardware using up to 8 virtual ergometers that parse and emit the exact framed binary packets (`FF FF FF FB` / `FC` / `FE` / `"READ"`), complete with AI pacing profiles, manual `SPACEBAR` paddling, boost/spin-out test triggers, and a live TX/RX hex inspector.
 - **Arcade Regatta Track**: Real-time animated kayak sprint course with dynamic lane visibility (auto-hides disconnected lanes, supports USB hotplugging), live gap-to-next-boat readouts, dynamic turbo boost flames driven by real ergometer acceleration/sprint telemetry, course zoom, and race voice cues + arcade audio.
 - **Mobile Web Race Remote**: Built-in zero-dependency HTTP server (default port `8080`) with an in-app **QR code** so a coach or race director can configure, start, abort, and monitor races from any phone or tablet on the same Wi-Fi network.
-- **Automatic Result Logging & Persisted Settings**: Race results are automatically appended to `./results/Results_YYYY_MM_DD.txt`, and your configured lane count is remembered across runs.
+- **Automatic Result & Communication Logging**: Race results are automatically appended to `./results/Results_YYYY_MM_DD.txt`, full bidirectional per-race ergometer wire traffic (`TX`, `RX`, raw hex, decoded fields, and state/anomaly diagnostics) is logged to `./logs/Race_<timestamp>_No<N>_<dist>m.log` for debugging, and your configured lane count is remembered across runs.
 
 ---
 
@@ -297,6 +297,7 @@ On macOS, `UsbHidErgoTransport` uses **Backend 2 (`hidapi` via JNA)** on top of 
 | Item | Location | Description |
 | :--- | :--- | :--- |
 | **Race Results** | `./results/Results_YYYY_MM_DD.txt` | Plain-text race log appended automatically whenever a race finishes (or is ended early), formatted compatibly with Dansprint 2.06 (position, lane, time, weight). |
+| **Per-Race Comm Logs** | `./logs/Race_YYYY_MM_DD_HH-mm-ss_No<N>_<dist>m.log` | Pipe-delimited bidirectional wire trace created automatically for every race, capturing 100% of `TX` (Host → Ergo) and `RX` (Ergo → Host) traffic with decoded fields, full raw hex bytes, state transitions, gunshot clock offsets, checksum/buffer errors, stale telemetry timeouts, and final lane summaries. |
 | **App Settings** | `${XDG_CONFIG_HOME:-~/.config}/virtual-race/settings.properties` | Stores persistent user settings (currently `configuredLanesCount`). On Windows without `XDG_CONFIG_HOME`, resolves to `%USERPROFILE%\.config\virtual-race\settings.properties`. |
 | **Linux udev Rule** | `/etc/udev/rules.d/99-dansprint.rules` | Grants non-root read/write access to `/dev/hidraw*` for `16c0:1503` (created by `./install_dev_rule.sh`). |
 

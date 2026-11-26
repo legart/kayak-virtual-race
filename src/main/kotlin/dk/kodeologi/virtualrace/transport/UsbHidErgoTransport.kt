@@ -40,6 +40,7 @@ class UsbHidErgoTransport : ErgoTransport {
 
     private val serialNumbers = LongArray(DansprintProtocol.MAX_LANES)
     private val handleOpen = BooleanArray(DansprintProtocol.MAX_LANES)
+    private val lastIoErrors = arrayOfNulls<String>(DansprintProtocol.MAX_LANES)
     private var lastEnumeratedDeviceKeys: Set<String> = emptySet()
 
     enum class HotplugCheckResult {
@@ -480,7 +481,12 @@ class UsbHidErgoTransport : ErgoTransport {
 
     @Synchronized
     override fun writePacket(usbIndex: Int, packet: ByteArray, description: String): Boolean {
-        if (!isDeviceOpen(usbIndex)) return false
+        if (!isDeviceOpen(usbIndex)) {
+            if (usbIndex in 0 until DansprintProtocol.MAX_LANES) {
+                lastIoErrors[usbIndex] = "USB device handle not open"
+            }
+            return false
+        }
 
         // Byte 0 is HID Report ID 0x00 (unnumbered 40-byte Output report), followed by up to 40 payload bytes
         val report = ByteArray(DansprintProtocol.HID_OUTPUT_REPORT_LENGTH)
@@ -489,19 +495,29 @@ class UsbHidErgoTransport : ErgoTransport {
 
         val ok = if (activeBackendIsHidraw) {
             val fd = hidrawFds[usbIndex]
+            val node = hidrawNodeNames[usbIndex] ?: "hidraw?"
             val libc = linuxLibC
             if (fd < 0 || libc == null) {
+                lastIoErrors[usbIndex] = "hidraw fd closed on /dev/$node"
                 false
             } else {
                 try {
                     val written = libc.write(fd, report, report.size)
+                    if (written < 0) {
+                        lastIoErrors[usbIndex] = "hidraw write returned $written on /dev/$node"
+                    }
                     written >= 0
                 } catch (e: LastErrorException) {
-                    if (e.errorCode != EAGAIN && e.errorCode != EINTR) {
+                    val err = e.errorCode
+                    if (err != EAGAIN && err != EINTR) {
+                        lastIoErrors[usbIndex] = "hidraw write failed (errno=$err) on /dev/$node - handle closed"
                         closeSingleHidraw(usbIndex)
+                    } else {
+                        lastIoErrors[usbIndex] = "hidraw write transient errno=$err on /dev/$node"
                     }
                     false
-                } catch (_: Throwable) {
+                } catch (t: Throwable) {
+                    lastIoErrors[usbIndex] = "hidraw write exception (${t.message}) on /dev/$node - handle closed"
                     closeSingleHidraw(usbIndex)
                     false
                 }
@@ -510,10 +526,14 @@ class UsbHidErgoTransport : ErgoTransport {
             val handle = hidapiHandles[usbIndex]
             val lib = hidLib
             if (handle == null || lib == null) {
+                lastIoErrors[usbIndex] = "hidapi handle closed"
                 false
             } else {
                 val written = lib.hid_write(handle, report, report.size)
-                if (written < 0) handleOpen[usbIndex] = false
+                if (written < 0) {
+                    lastIoErrors[usbIndex] = "hid_write failed (ret=$written) - handle closed"
+                    handleOpen[usbIndex] = false
+                }
                 written >= 0
             }
         }
@@ -534,6 +554,7 @@ class UsbHidErgoTransport : ErgoTransport {
         val buf = ByteArray(64)
         val bytesRead = if (activeBackendIsHidraw) {
             val fd = hidrawFds[usbIndex]
+            val node = hidrawNodeNames[usbIndex] ?: "hidraw?"
             val libc = linuxLibC
             if (fd < 0 || libc == null) {
                 0
@@ -545,10 +566,12 @@ class UsbHidErgoTransport : ErgoTransport {
                     if (err == EAGAIN || err == EINTR) {
                         0 // Normal non-blocking empty poll
                     } else {
+                        lastIoErrors[usbIndex] = "hidraw read failed (errno=$err) on /dev/$node - handle closed"
                         closeSingleHidraw(usbIndex)
                         -1
                     }
-                } catch (_: Throwable) {
+                } catch (t: Throwable) {
+                    lastIoErrors[usbIndex] = "hidraw read exception (${t.message}) on /dev/$node - handle closed"
                     closeSingleHidraw(usbIndex)
                     -1
                 }
@@ -560,7 +583,10 @@ class UsbHidErgoTransport : ErgoTransport {
                 0
             } else {
                 val n = lib.hid_read(handle, buf, buf.size)
-                if (n < 0) handleOpen[usbIndex] = false
+                if (n < 0) {
+                    lastIoErrors[usbIndex] = "hid_read failed (ret=$n) - handle closed"
+                    handleOpen[usbIndex] = false
+                }
                 n
             }
         }
@@ -570,6 +596,14 @@ class UsbHidErgoTransport : ErgoTransport {
         val data = buf.copyOfRange(0, bytesRead)
         appendLog(WirePacketLogEntry.Direction.ERGO_TO_HOST, usbIndex, data, "USB HID Input ($bytesRead B)")
         return data
+    }
+
+    @Synchronized
+    override fun consumeLastIoError(usbIndex: Int): String? {
+        if (usbIndex !in 0 until DansprintProtocol.MAX_LANES) return null
+        val err = lastIoErrors[usbIndex]
+        lastIoErrors[usbIndex] = null
+        return err
     }
 
     @Synchronized
@@ -601,6 +635,7 @@ class UsbHidErgoTransport : ErgoTransport {
             hidapiHandles[i] = null
             handleOpen[i] = false
             serialNumbers[i] = 0L
+            lastIoErrors[i] = null
         }
         lastEnumeratedDeviceKeys = emptySet()
     }

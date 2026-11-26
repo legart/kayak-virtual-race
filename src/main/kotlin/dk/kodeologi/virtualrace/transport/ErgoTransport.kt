@@ -63,6 +63,12 @@ interface ErgoTransport {
     fun readNonBlocking(usbIndex: Int): ByteArray
 
     /**
+     * Returns and clears the most recent low-level I/O error (e.g. errno or closed handle)
+     * recorded for [usbIndex], or null if no error occurred.
+     */
+    fun consumeLastIoError(usbIndex: Int): String? = null
+
+    /**
      * Closes all open USB handles.
      */
     fun closeAll()
