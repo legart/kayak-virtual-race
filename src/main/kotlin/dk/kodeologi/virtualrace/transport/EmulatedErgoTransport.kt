@@ -95,6 +95,7 @@ class EmulatedErgoTransport : ErgoTransport {
     private val rxQueues = Array(DansprintProtocol.MAX_LANES) { ConcurrentLinkedQueue<ByteArray>() }
 
     // Internal simulation clocks per device
+    private val ergoDistanceSetWallMs = LongArray(DansprintProtocol.MAX_LANES)
     private val ergoStartWallMs = LongArray(DansprintProtocol.MAX_LANES)
     private val lastTelemetryEmitMs = LongArray(DansprintProtocol.MAX_LANES)
     private val lastPreStartStrokeEmitMs = LongArray(DansprintProtocol.MAX_LANES)
@@ -255,16 +256,16 @@ class EmulatedErgoTransport : ErgoTransport {
             manualStrokeEnergyKmh[idx] = (manualStrokeEnergyKmh[idx] + 5.2f).coerceAtMost(23.5f)
             val u = _units.value[idx]
             if (u.ergoInternalMode == EmulatedErgoUnitState.ErgoInternalMode.PRE_START_COUNTDOWN) {
-                // Paddling during pre-start countdown emits Opcode 0x04 with high flywheel metric -> triggers Stop Paddling wait or False Start!
+                // Paddling during pre-start countdown emits Opcode 0x10 with high flywheel metric -> triggers Stop Paddling wait or False Start!
                 val periodTicks = DansprintProtocol.FLYWHEEL_METRIC_NUMERATOR / 240.0f
                 enqueueErgoPacket(
                     idx,
                     DansprintProtocol.buildErgoType1Packet(
-                        opcode = 0x04,
+                        opcode = DansprintProtocol.ERGO_OPCODE_STROKE_ACTIVITY,
                         floatVal12 = periodTicks,
                         ticksSincePulse = 20_000L // 40 ms (< 300ms false start threshold!)
                     ),
-                    "Manual Pre-Start Stroke Opcode 0x04 (Metric=240.0)"
+                    "Manual Pre-Start Stroke Opcode 0x10 (Metric=240.0)"
                 )
             }
         }
@@ -366,8 +367,9 @@ class EmulatedErgoTransport : ErgoTransport {
             }
 
             HostCommandOpcode.CMD_SET_DISTANCE -> {
-                // 0x07: Store race distance from p[0..3] and acknowledge with Type 3 (FF FF FF FE)
+                // 0x07: Store race distance from p[0..3], reset 500 kHz tick origin, and acknowledge with Type 3 (FF FF FF FE)
                 val distMeters = bb.getFloat(payloadOffset)
+                ergoDistanceSetWallMs[usbIndex] = now
                 updateUnit(usbIndex) {
                     it.copy(
                         configuredRaceDistanceMeters = if (distMeters > 0f) distMeters else 200f,
@@ -471,7 +473,7 @@ class EmulatedErgoTransport : ErgoTransport {
                 }
 
                 EmulatedErgoUnitState.ErgoInternalMode.PRE_START_COUNTDOWN -> {
-                    // Every 200ms during pre-start, send Type 1 Opcode 0x04 (Stroke / Flywheel telemetry)
+                    // Every 200ms during pre-start, send Type 1 Opcode 0x10 (Stroke / Flywheel telemetry)
                     if (now - lastPreStartStrokeEmitMs[idx] >= 200L) {
                         lastPreStartStrokeEmitMs[idx] = now
                         val isPaddling = u.forcePreStartPaddling || manualStrokeEnergyKmh[idx] > 2.0f
@@ -484,11 +486,11 @@ class EmulatedErgoTransport : ErgoTransport {
                         enqueueErgoPacket(
                             idx,
                             DansprintProtocol.buildErgoType1Packet(
-                                opcode = 0x04,
+                                opcode = DansprintProtocol.ERGO_OPCODE_STROKE_ACTIVITY,
                                 floatVal12 = periodTicks,
                                 ticksSincePulse = pulseAgeTicks
                             ),
-                            if (isPaddling) "Pre-Start Paddling! Opcode 0x04" else "Pre-Start Stillness Opcode 0x04"
+                            if (isPaddling) "Pre-Start Paddling! Opcode 0x10" else "Pre-Start Stillness Opcode 0x10"
                         )
                     }
                 }
@@ -541,7 +543,8 @@ class EmulatedErgoTransport : ErgoTransport {
                     // Emit Type 2 (FF FF FF FC) telemetry every ~120ms when distance changes
                     if (now - lastTelemetryEmitMs[idx] >= 120L) {
                         lastTelemetryEmitMs[idx] = now
-                        val ergoTicks = elapsedRaceMs * DansprintProtocol.ERGO_TICKS_PER_MS
+                        val tickOriginMs = if (ergoDistanceSetWallMs[idx] > 0L) ergoDistanceSetWallMs[idx] else ergoStartWallMs[idx]
+                        val ergoTicks = (now - tickOriginMs).coerceAtLeast(1L) * DansprintProtocol.ERGO_TICKS_PER_MS
                         val speedMPerTick = DansprintProtocol.speedKmhToMetersPerTick(effectiveSpeedKmh)
                         enqueueErgoPacket(
                             idx,
@@ -569,14 +572,14 @@ class EmulatedErgoTransport : ErgoTransport {
                                 spinOutRemainingMs = 0L
                             )
                         }
-                        // Send official finish time packet: Type 1 Opcode 0x07 with float(finishTimeMs) at p[12..15]
+                        // Send official finish time packet: Type 1 Opcode 0x08 with float(finishTimeMs) at p[12..15]
                         enqueueErgoPacket(
                             idx,
                             DansprintProtocol.buildErgoType1Packet(
-                                opcode = 0x07,
+                                opcode = DansprintProtocol.ERGO_OPCODE_FINISH_OR_DIST_REQ,
                                 floatVal12 = finishTimeMs
                             ),
-                            "FINISHED! Opcode 0x07 Time=${DansprintProtocol.formatRaceTimeMs(finishTimeMs)}"
+                            "FINISHED! Opcode 0x08 Time=${DansprintProtocol.formatRaceTimeMs(finishTimeMs)}"
                         )
                     }
                 }

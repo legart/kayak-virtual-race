@@ -200,7 +200,7 @@ class RaceEngine(
     private val prevType2RxMs = LongArray(DansprintProtocol.MAX_LANES)
     private val lastRxWallMs = LongArray(DansprintProtocol.MAX_LANES)
     private val lastDistance0x07SentMs = LongArray(DansprintProtocol.MAX_LANES)
-    private val laneRaceStartOffsetMs = LongArray(DansprintProtocol.MAX_LANES)
+    internal val laneRaceStartOffsetMs = LongArray(DansprintProtocol.MAX_LANES)
 
     // State machine timers (`0x488a1c`, `0x4882d8` .. `0x4882fa`)
     private var timerOriginWallMs: Long = System.currentTimeMillis()
@@ -402,9 +402,9 @@ class RaceEngine(
         }
 
         // Clear all active flags and reset race state (0x4052d8 -> 0x4052f8)
+        resetRaceRuntimeCounters()
         updateLanes { idx, lane ->
             speedFifoCount[idx] = 0
-            prevType2Distance[idx] = -1f
             boostTrackers[idx].reset()
             lane.copy(
                 active = (current.usingEmulator && lane.connected),
@@ -477,6 +477,7 @@ class RaceEngine(
         // 4. Execute exact StartRace sequence (0x40c8fe - 0x40c924)
         broadcastToConnectedLanes(HostCommandOpcode.CMD_START_SEQ_PREP) // 0x1D
         resetTimer()
+        resetRaceRuntimeCounters()
         state1SentInitial0x07 = false
         state1LastSyncMs = 0L
         state1StillnessCount = 0
@@ -524,6 +525,7 @@ class RaceEngine(
             return
         }
         resetTimer()
+        resetRaceRuntimeCounters()
         state5LastSyncMs = 0L
 
         updateLanes { idx, lane ->
@@ -684,13 +686,23 @@ class RaceEngine(
     // Internal State Machine & Packet Processing (`Calc_race` & `Communication`)
     // =========================================================================
 
+    private fun resetRaceRuntimeCounters() {
+        prevType2Distance.fill(-1f)
+        lastType2RxMs.fill(0L)
+        prevType2RxMs.fill(0L)
+        laneRaceStartOffsetMs.fill(0L)
+        lastLeaderBroadcastMs = 0L
+        leaderBroadcastRoundRobinLane = 0
+        leaderFinishedBroadcastTicks = 0
+    }
+
     private fun abortAndResetRaceInternal() {
         broadcastToConnectedLanes(HostCommandOpcode.CMD_STOP_ABORT_RACE) // 0x12
         recalculateCourseViewZoom(_uiState.value.raceDistanceMeters)
+        resetRaceRuntimeCounters()
 
         updateLanes { idx, lane ->
             speedFifoCount[idx] = 0
-            prevType2Distance[idx] = -1f
             boostTrackers[idx].reset()
             lane.copy(
                 interpolatedDistanceMeters = 0f,
@@ -740,7 +752,7 @@ class RaceEngine(
                 currentDiscoveryUsbIdx = i
                 sendType1ToSingle(i, HostCommandOpcode.CMD_INIT_CONNECT)
                 sendType1ToSingle(i, HostCommandOpcode.CMD_POLL_STATUS)
-                pollIncomingForDevice(i)
+                pollIncomingForDevice(usbIdx)
             }
         }
     }
@@ -771,7 +783,7 @@ class RaceEngine(
         }
     }
 
-    private fun handleIncomingPacket(
+    internal fun handleIncomingPacket(
         usbIdx: Int,
         laneIdx: Int,
         pkt: IncomingErgoPacket,
@@ -793,7 +805,7 @@ class RaceEngine(
             }
 
             is IncomingErgoPacket.ConnectResetReply -> {
-                // 0x405a6f: Opcode 0x0F reply
+                // 0x405a6f: Opcode 0x00 reset/power-reapplied reply
                 updateSingleLane(laneIdx) {
                     it.copy(
                         powerReapplied = true,
@@ -816,8 +828,10 @@ class RaceEngine(
                         it.copy(connected = true, powerReapplied = false)
                     }
                 }
-                if (state == RaceState.IDLE_PRE_RACE || state == RaceState.STARTUP_DISCOVERY) {
-                    val reportedLaneIdx = (pkt.laneNumber1Based - 1).coerceIn(0, 7)
+                if ((state == RaceState.IDLE_PRE_RACE || state == RaceState.STARTUP_DISCOVERY) &&
+                    pkt.laneNumber1Based in 1..DansprintProtocol.MAX_LANES
+                ) {
+                    val reportedLaneIdx = pkt.laneNumber1Based - 1
                     // 0x40d910: Map USB device -> reported lane
                     laneToUsb[reportedLaneIdx] = usbIdx
                     usbToLane[usbIdx] = reportedLaneIdx
@@ -826,7 +840,7 @@ class RaceEngine(
             }
 
             is IncomingErgoPacket.StrokeActivity -> {
-                // 0x405a94: Opcode 0x04 flywheel & pulse age telemetry
+                // 0x405a94: Opcode 0x10 flywheel & pulse age telemetry
                 updateSingleLane(laneIdx) {
                     it.copy(
                         flywheelMetric = pkt.flywheelMetric,
@@ -836,26 +850,29 @@ class RaceEngine(
             }
 
             is IncomingErgoPacket.FinishOrDistanceAck -> {
-                // 0x405b00: Opcode 0x07
+                // 0x405b00: Opcode 0x08 (distance request in States 1/2, official finish time in State 6)
                 if (state == RaceState.STOP_PADDLING || state == RaceState.START_POSITION) {
                     sendSetDistanceToSingle(laneIdx)
                 }
-                if (state == RaceState.RACING) {
+                if (state == RaceState.RACING && pkt.finishTimeMs > 0f) {
                     val raceDist = _uiState.value.raceDistanceMeters.toFloat()
-                    speedFifoCount[laneIdx] = 0
-                    boostTrackers[laneIdx].reset()
-                    updateSingleLane(laneIdx) {
-                        it.copy(
-                            finishTimeMs = pkt.finishTimeMs,
-                            rawDistanceMeters = raceDist,
-                            interpolatedDistanceMeters = raceDist,
-                            speedMetersPerTick = 0f,
-                            displayedSpeedKmh = 0f,
-                            isBoosting = false,
-                            boostIntensity = 0f
-                        )
+                    val alreadyFinished = _uiState.value.lanes[laneIdx].isFinished
+                    if (!alreadyFinished) {
+                        speedFifoCount[laneIdx] = 0
+                        boostTrackers[laneIdx].reset()
+                        updateSingleLane(laneIdx) {
+                            it.copy(
+                                finishTimeMs = pkt.finishTimeMs,
+                                rawDistanceMeters = raceDist,
+                                interpolatedDistanceMeters = raceDist,
+                                speedMetersPerTick = 0f,
+                                displayedSpeedKmh = 0f,
+                                isBoosting = false,
+                                boostIntensity = 0f
+                            )
+                        }
+                        SoundPlayer.playArcadeTone(880.0, 90)
                     }
-                    SoundPlayer.playArcadeTone(880.0, 90)
                 }
             }
 
@@ -1053,7 +1070,7 @@ class RaceEngine(
     /**
      * Main Race State Machine dispatcher (`0x40480c` in `Calc_race`).
      */
-    private fun stepRaceStateMachine() {
+    internal fun stepRaceStateMachine() {
         val current = _uiState.value
         val nowMs = elapsedTimerMs()
         val numLanes = current.configuredLanesCount
@@ -1371,7 +1388,7 @@ class RaceEngine(
      * Dead-reckoning distance interpolation between Type 2 packets, 2-second stale speed timeout,
      * live position ordering, and leader tracking.
      */
-    private fun updateRacingInterpolation(nowMs: Long, numLanes: Int) {
+    internal fun updateRacingInterpolation(nowMs: Long, numLanes: Int) {
         val raceDist = _uiState.value.raceDistanceMeters.toFloat()
         var maxDist = _uiState.value.maxBoatDistanceMeters
 
@@ -1407,10 +1424,14 @@ class RaceEngine(
                     boostTrackers[idx].evaluateAt(nowMs, effectiveDisplayedKmh)
                 }
 
-                // Dead-reckoning interpolation (`0x404924`)
-                val hostTicks = (nowMs - laneRaceStartOffsetMs[idx]).coerceAtLeast(0L) * DansprintProtocol.ERGO_TICKS_PER_MS
-                val deltaTicks = (hostTicks - lane.ergoTicks).coerceAtLeast(0L)
-                val interpDist = if (deltaTicks < 1_500_000L) {
+                // Dead-reckoning interpolation (`0x404924`):
+                // The ergometer's 500 kHz tick counter starts when CMD_SET_DISTANCE (0x07) is sent,
+                // which is laneRaceStartOffsetMs[idx] BEFORE gunshot (when host nowMs resets to 0).
+                // Match 0x404944..0x40495a: delta = (nowMs * 500) - (ergoTicks - offsetMs * 500).
+                val hostTicks = nowMs * DansprintProtocol.ERGO_TICKS_PER_MS
+                val adjustedErgoTicks = lane.ergoTicks - laneRaceStartOffsetMs[idx] * DansprintProtocol.ERGO_TICKS_PER_MS
+                val deltaTicks = hostTicks - adjustedErgoTicks
+                val interpDist = if (deltaTicks in 0L until 1_500_000L) {
                     lane.rawDistanceMeters + deltaTicks.toFloat() * effectiveSpeedMPerTick
                 } else {
                     lane.rawDistanceMeters
@@ -1650,6 +1671,10 @@ class RaceEngine(
 
     private fun elapsedTimerMs(): Long {
         return (System.currentTimeMillis() - timerOriginWallMs).coerceAtLeast(0L)
+    }
+
+    internal fun setStateForTest(transform: (RaceUiState) -> RaceUiState) {
+        _uiState.value = transform(_uiState.value)
     }
 
     private fun updateSingleLane(laneIndex: Int, transform: (LaneTelemetryState) -> LaneTelemetryState) {

@@ -72,6 +72,44 @@ class DansprintProtocolTest {
     }
 
     @Test
+    fun `test ErgoStreamParser decodes real hardware Type 1 opcodes 0x08 finish, 0x10 stroke, 0x00 reset`() {
+        val parser = ErgoStreamParser()
+
+        // 1. Official Race Finish Time is Ergo -> Host Type 1 Opcode 0x08 (0x405b00 in DansprintVirtualRaceUSB.exe)
+        val finishFrame = DansprintProtocol.buildErgoType1Packet(
+            opcode = DansprintProtocol.ERGO_OPCODE_FINISH_OR_DIST_REQ,
+            floatVal12 = 24_350.0f
+        )
+        assertEquals(0x08.toByte(), finishFrame[4 + 22])
+        val finishPackets = parser.feedBytes(DansprintProtocol.padToHidInputReport(finishFrame))
+        assertEquals(1, finishPackets.size)
+        val finish = finishPackets.first() as? IncomingErgoPacket.FinishOrDistanceAck
+        assertNotNull(finish)
+        assertEquals(24_350.0f, finish.finishTimeMs, 0.01f)
+
+        // 2. Pre-start Flywheel / Stroke Activity is Ergo -> Host Type 1 Opcode 0x10 (0x405a94)
+        val strokeFrame = DansprintProtocol.buildErgoType1Packet(
+            opcode = DansprintProtocol.ERGO_OPCODE_STROKE_ACTIVITY,
+            floatVal12 = DansprintProtocol.FLYWHEEL_METRIC_NUMERATOR / 180.0f,
+            ticksSincePulse = 50_000L // 100 ms
+        )
+        assertEquals(0x10.toByte(), strokeFrame[4 + 22])
+        val strokePackets = parser.feedBytes(DansprintProtocol.padToHidInputReport(strokeFrame))
+        assertEquals(1, strokePackets.size)
+        val stroke = strokePackets.first() as? IncomingErgoPacket.StrokeActivity
+        assertNotNull(stroke)
+        assertEquals(180.0f, stroke.flywheelMetric, 0.5f)
+        assertEquals(100L, stroke.msSincePulse)
+
+        // 3. Reset / Power-reapplied reply is Ergo -> Host Type 1 Opcode 0x00 (0x405a6f)
+        val resetFrame = DansprintProtocol.buildErgoType1Packet(opcode = DansprintProtocol.ERGO_OPCODE_RESET)
+        assertEquals(0x00.toByte(), resetFrame[4 + 22])
+        val resetPackets = parser.feedBytes(DansprintProtocol.padToHidInputReport(resetFrame))
+        assertEquals(1, resetPackets.size)
+        assertTrue(resetPackets.first() is IncomingErgoPacket.ConnectResetReply)
+    }
+
+    @Test
     fun `test EmulatedErgoTransport full protocol handshake and race telemetry`() {
         val emulator = EmulatedErgoTransport()
         val devices = emulator.enumerateAndOpenDevices()

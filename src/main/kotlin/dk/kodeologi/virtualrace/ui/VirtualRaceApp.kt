@@ -687,7 +687,7 @@ private fun ColumnScope.EmulatorControlsTab(
         }
 
         Text(
-            text = "Trigger speed boosts, spin-outs, false-start movement (0x04), hardware lane conflicts (0x0E), or 'READ' power resets:",
+            text = "Trigger speed boosts, spin-outs, false-start movement (0x10), hardware lane conflicts (0x0E), or 'READ' power resets:",
             color = Color(0xFFB3E5FC),
             fontSize = 10.sp
         )

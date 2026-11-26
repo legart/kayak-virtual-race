@@ -42,6 +42,14 @@ object DansprintProtocol {
     const val TYPE2_PAYLOAD_LEN: Int = 14 // 0x0E -> Total frame = 18 bytes
     const val TYPE3_PAYLOAD_LEN: Int = 6  // 0x06 -> Total frame = 10 bytes
 
+    // Ergometer -> Host Type 1 opcodes (dispatched via jump table at 0x405a39 / 0x405a4f in DansprintVirtualRaceUSB.exe)
+    const val ERGO_OPCODE_RESET: Int = 0x00            // 0x405a6f: Reset / power-reapplied reply
+    const val ERGO_OPCODE_FINISH_OR_DIST_REQ: Int = 0x08 // 0x405b00: Official finish time (State 6) or distance request (States 1/2)
+    const val ERGO_OPCODE_LANE_STATUS: Int = 0x0E      // 0x405b5d: 1-based lane number & status reply
+    const val ERGO_OPCODE_STROKE_ACTIVITY: Int = 0x10  // 0x405a94: Flywheel period & pulse age (stillness / false start)
+    const val ERGO_OPCODE_WEIGHT_14: Int = 0x14        // 0x405ba8: Paddler weight in kg
+    const val ERGO_OPCODE_WEIGHT_15: Int = 0x15        // 0x405bb9: Paddler weight in kg
+
     val SYNC_TYPE1: ByteArray = byteArrayOf(0xFF.toByte(), 0xFF.toByte(), 0xFF.toByte(), 0xFB.toByte())
     val SYNC_TYPE2: ByteArray = byteArrayOf(0xFF.toByte(), 0xFF.toByte(), 0xFF.toByte(), 0xFC.toByte())
     val SYNC_TYPE3: ByteArray = byteArrayOf(0xFF.toByte(), 0xFF.toByte(), 0xFF.toByte(), 0xFE.toByte())
@@ -233,7 +241,7 @@ enum class HostCommandOpcode(val code: Int, val label: String) {
 sealed interface IncomingErgoPacket {
     val summary: String
 
-    /** Type 1 Opcode 0x04: Flywheel period & time since last pulse (0x405a94) */
+    /** Type 1 Opcode 0x10: Flywheel period & time since last pulse (0x405a94) */
     data class StrokeActivity(
         val flywheelPeriodTicks: Float,
         val flywheelMetric: Float,
@@ -241,15 +249,15 @@ sealed interface IncomingErgoPacket {
         val msSincePulse: Long
     ) : IncomingErgoPacket {
         override val summary: String
-            get() = "Type1[0x04 Stroke] metric=%.1f, pulseAge=%dms".format(flywheelMetric, msSincePulse)
+            get() = "Type1[0x10 Stroke] metric=%.1f, pulseAge=%dms".format(flywheelMetric, msSincePulse)
     }
 
-    /** Type 1 Opcode 0x07: Official finish time in ms (in State 6) or distance request (in States 1/2) (0x405b00) */
+    /** Type 1 Opcode 0x08: Official finish time in ms (in State 6) or distance request (in States 1/2) (0x405b00) */
     data class FinishOrDistanceAck(
         val finishTimeMs: Float
     ) : IncomingErgoPacket {
         override val summary: String
-            get() = "Type1[0x07 Finish/Ack] finishTime=%.1fms (%s)".format(
+            get() = "Type1[0x08 Finish/Ack] finishTime=%.1fms (%s)".format(
                 finishTimeMs,
                 DansprintProtocol.formatRaceTimeMs(finishTimeMs)
             )
@@ -263,9 +271,9 @@ sealed interface IncomingErgoPacket {
             get() = "Type1[0x0E Status] Lane=$laneNumber1Based"
     }
 
-    /** Type 1 Opcode 0x0F: Ergometer init/reset reply (0x405a6f) */
+    /** Type 1 Opcode 0x00: Ergometer init/reset reply (0x405a6f) */
     data object ConnectResetReply : IncomingErgoPacket {
-        override val summary: String = "Type1[0x0F Reset/Init Reply]"
+        override val summary: String = "Type1[0x00 Reset/Init Reply]"
     }
 
     /** Type 1 Opcode 0x14 or 0x15: Paddler weight in kg (0x405ba8, 0x405bb9) */
@@ -472,23 +480,24 @@ class ErgoStreamParser {
             .order(ByteOrder.LITTLE_ENDIAN)
         val opcode = buf[offset + 22].toInt() and 0xFF
         return when (opcode) {
-            0x04 -> {
+            DansprintProtocol.ERGO_OPCODE_STROKE_ACTIVITY -> {
                 val periodTicks = bb.getFloat(offset + 12)
                 val metric = if (periodTicks == 0.0f) 0.0f else DansprintProtocol.FLYWHEEL_METRIC_NUMERATOR / periodTicks
                 val ticksSincePulse = bb.getInt(offset + 16).toLong() and 0xFFFFFFFFL
                 val msSincePulse = (ticksSincePulse.toDouble() * DansprintProtocol.MS_PER_ERGO_TICK).roundToLong()
                 IncomingErgoPacket.StrokeActivity(periodTicks, metric, ticksSincePulse, msSincePulse)
             }
-            0x07 -> {
+            DansprintProtocol.ERGO_OPCODE_FINISH_OR_DIST_REQ -> {
                 val finishTimeMs = bb.getFloat(offset + 12)
                 IncomingErgoPacket.FinishOrDistanceAck(finishTimeMs)
             }
-            0x0E -> {
+            DansprintProtocol.ERGO_OPCODE_LANE_STATUS -> {
                 val lane1Based = bb.getShort(offset + 8).toInt() and 0xFFFF
                 IncomingErgoPacket.LaneStatusReply(lane1Based)
             }
-            0x0F -> IncomingErgoPacket.ConnectResetReply
-            0x14, 0x15 -> {
+            DansprintProtocol.ERGO_OPCODE_RESET -> IncomingErgoPacket.ConnectResetReply
+            DansprintProtocol.ERGO_OPCODE_WEIGHT_14,
+            DansprintProtocol.ERGO_OPCODE_WEIGHT_15 -> {
                 val weightKg = bb.getShort(offset + 8).toInt() and 0xFFFF
                 IncomingErgoPacket.WeightReport(weightKg, opcode)
             }
